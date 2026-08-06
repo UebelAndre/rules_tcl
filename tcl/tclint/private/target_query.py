@@ -1,0 +1,351 @@
+"""Target-discovery helper for the tclint fixer.
+
+Uses `bazel query` in loading phase (never `cquery` or `build`, so
+targets marked incompatible with the host platform are not silently
+dropped) to return the set of `.tcl` / `.do` source files reachable
+from a scope.
+
+Strategy is an iterative BFS through only file-carrying attributes
+(`srcs`, `main`, `data`) rather than `deps(...)`. `deps(...)` follows
+every label attribute including `deps` / `data` / toolchain refs, which
+on large monorepos materializes the entire transitive graph and can
+OOM Bazel. BFS confines each round to the labels we actually need to
+walk (source files and filegroups reachable via `srcs`/`main`/etc.)
+and is bounded by the depth of filegroup nesting -- typically 1-2
+levels.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+_TCL_SUFFIXES: tuple[str, ...] = (".tcl", ".do")
+
+# File-carrying attributes traversed below the tcl-rule boundary.
+# `deps` is intentionally excluded -- dep targets get picked up on
+# their own via the scope; the fixer scope determines what is
+# formatted, not what a target depends on.
+_SUBTREE_FILE_ATTRS: frozenset[str] = frozenset(("srcs", "main", "data"))
+
+# Attributes read at the root of a tcl rule target itself. `data` is
+# deliberately absent -- runtime fixtures pulled in via `data` at the
+# root are not first-party sources we want to reformat.
+_ROOT_FILE_ATTRS: tuple[str, ...] = ("srcs", "main")
+
+_SOURCE_FILE_KIND = "__source_file__"
+
+
+@dataclass
+class _Entity:
+    """Parsed record from `--output=streamed_jsonproto`."""
+
+    label: str
+    kind: str  # rule class, or `_SOURCE_FILE_KIND` for source files
+    tags: list[str] = field(default_factory=list)
+    attr_labels: dict[str, list[str]] = field(default_factory=dict)
+
+
+def find_bazel() -> Path:
+    """Locate a Bazel executable."""
+    if "BAZEL_REAL" in os.environ:
+        return Path(os.environ["BAZEL_REAL"])
+
+    for filename in ["bazel", "bazel.exe", "bazelisk", "bazelisk.exe"]:
+        path = shutil.which(filename)
+        if path:
+            return Path(path)
+
+    raise FileNotFoundError("Could not locate a Bazel binary")
+
+
+def resolve_source_paths(
+    scope: Sequence[str],
+    bazel: Path,
+    workspace_dir: Path,
+    *,
+    ignore_tags: Sequence[str] = (),
+) -> list[str]:
+    """Return every workspace-relative `.tcl` / `.do` path in scope, sorted + deduped."""
+    entities: dict[str, _Entity] = {}
+    root_labels, scope_source_files = _fetch_roots(
+        bazel, workspace_dir, scope, entities, ignore_tags
+    )
+    _bfs_file_subgraph(bazel, workspace_dir, root_labels, entities)
+
+    files: set[str] = set()
+    for label in root_labels:
+        for path in _resolve_files(entities[label], entities):
+            files.add(path)
+    for entity in scope_source_files:
+        files.add(_label_to_path(entity.label))
+    return sorted(files)
+
+
+def _fetch_roots(
+    bazel: Path,
+    workspace_dir: Path,
+    scope: Sequence[str],
+    entities: dict[str, _Entity],
+    ignore_tags: Sequence[str],
+) -> tuple[list[str], list[_Entity]]:
+    """Round 1: fetch scope roots + their attributes; split rules vs scope-level source files.
+
+    Wildcards in `scope` are handled by Bazel here -- no need to enumerate
+    labels first. The `kind("tcl_.*", ...)` gate is our loading-phase
+    proxy for the `TclInfo` provider (we can't ask query about
+    providers, and `cquery`/aspects would drop incompatible targets).
+    The `filter` clause keeps `//pkg:foo.tcl` explicit scopes working.
+    Tag filtering runs in Python against the streamed attribute data,
+    not as an `attr(tags, ...)` regex, so there is no escaping/case
+    foot-gun.
+    """
+    scope_str = " ".join(scope)
+    roots_query = (
+        f'kind("tcl_.*", set({scope_str}))'
+        f' union filter("\\.(tcl|do)$", kind("source file", set({scope_str})))'
+    )
+    root_labels: list[str] = []
+    scope_source_files: list[_Entity] = []
+    for entity in _stream_query(bazel, workspace_dir, roots_query):
+        entities[entity.label] = entity
+        if entity.kind == _SOURCE_FILE_KIND:
+            # Source files reached via BFS are already attached to the
+            # parent rule that pulled them in; this branch only fires
+            # for `//pkg:foo.tcl` labels named directly in scope.
+            scope_source_files.append(entity)
+        else:
+            root_labels.append(entity.label)
+
+    ignore_set = {_normalize_tag(t) for t in ignore_tags if t}
+    if ignore_set:
+        root_labels = [
+            label
+            for label in root_labels
+            if not any(
+                _normalize_tag(tag) in ignore_set for tag in entities[label].tags
+            )
+        ]
+    return root_labels, scope_source_files
+
+
+def _bfs_file_subgraph(
+    bazel: Path,
+    workspace_dir: Path,
+    root_labels: Sequence[str],
+    entities: dict[str, _Entity],
+) -> None:
+    """Iteratively fetch labels reached via file-carrying attributes.
+
+    First expansion uses only `_ROOT_FILE_ATTRS` at each root; every
+    subsequent round uses `_SUBTREE_FILE_ATTRS`. Bounded by filegroup
+    nesting depth -- typically 1-2 rounds -- so this is cheap even
+    though each round is its own `bazel query` invocation.
+    """
+    to_fetch: set[str] = set()
+    for label in root_labels:
+        entity = entities[label]
+        for attr in _ROOT_FILE_ATTRS:
+            for child in entity.attr_labels.get(attr, []):
+                _enqueue(entities, to_fetch, child)
+
+    while to_fetch:
+        current = to_fetch
+        to_fetch = set()
+        _fetch_labels(bazel, workspace_dir, entities, current)
+        for label in current:
+            fetched = entities.get(label)
+            if fetched is None or fetched.kind == _SOURCE_FILE_KIND:
+                continue
+            for attr in _SUBTREE_FILE_ATTRS:
+                for child in fetched.attr_labels.get(attr, []):
+                    _enqueue(entities, to_fetch, child)
+
+
+def _resolve_files(root: _Entity, entities: dict[str, _Entity]) -> set[str]:
+    """Walk the file-carrying subgraph starting at a tcl-rule root.
+
+    Only `_ROOT_FILE_ATTRS` are read on `root`. Any rule reached below
+    the root has all of `_SUBTREE_FILE_ATTRS` inspected. External
+    labels (`@repo//...`) are skipped so third-party sources are never
+    returned.
+    """
+    files: set[str] = set()
+    visited: set[str] = set()
+
+    def _visit(label: str) -> None:
+        if label.startswith("@") or label in visited:
+            return
+        entity = entities.get(label)
+        if entity is None:
+            return
+        if entity.kind == _SOURCE_FILE_KIND:
+            path = _label_to_path(label)
+            if path.endswith(_TCL_SUFFIXES):
+                files.add(path)
+            return
+        visited.add(label)
+        for attr in _SUBTREE_FILE_ATTRS:
+            for child in entity.attr_labels.get(attr, []):
+                _visit(child)
+
+    for attr in _ROOT_FILE_ATTRS:
+        for child in root.attr_labels.get(attr, []):
+            _visit(child)
+
+    return files
+
+
+def _normalize_tag(tag: str) -> str:
+    """Fold BUILD-file tag spelling variants to a single form.
+
+    Mirrors the check aspects' `tag.replace("-","_").lower()` so a
+    target tagged `no-format`, `NO_FORMAT`, or `no_format` all compare
+    equal.
+    """
+    return tag.replace("-", "_").lower()
+
+
+def _enqueue(entities: dict[str, _Entity], queue: set[str], label: str) -> None:
+    """Add a label to the BFS queue unless we've already handled it."""
+    if not label or label.startswith("@"):
+        # External sources are never formatted.
+        return
+    if label in entities or label in queue:
+        return
+    queue.add(label)
+
+
+def _fetch_labels(
+    bazel: Path,
+    workspace_dir: Path,
+    entities: dict[str, _Entity],
+    labels: set[str],
+) -> None:
+    """Fetch attributes for `labels` in a single query.
+
+    Uses `--query_file` rather than an inline expression so batches of
+    tens of thousands of labels don't hit argv length limits.
+    """
+    if not labels:
+        return
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".query",
+        prefix="tcl_target_query_",
+        encoding="utf-8",
+        delete=False,
+    ) as fh:
+        # Labels can contain spaces / parens / other characters the
+        # query lexer treats as syntax. Quoting every label sidesteps
+        # that -- inside a double-quoted label only `"` and `\` need
+        # escaping.
+        fh.write(
+            "set(" + " ".join(_quote_query_label(label) for label in labels) + ")\n"
+        )
+        query_file = fh.name
+    try:
+        for entity in _stream_query(bazel, workspace_dir, "--query_file=" + query_file):
+            entities[entity.label] = entity
+    finally:
+        Path(query_file).unlink(missing_ok=True)
+
+
+def _stream_query(
+    bazel: Path, workspace_dir: Path, *query_argv: str
+) -> Iterator[_Entity]:
+    """Stream a `bazel query --output=streamed_jsonproto` result line by line."""
+    argv = [
+        str(bazel),
+        "query",
+        *query_argv,
+        "--noimplicit_deps",
+        "--keep_going",
+        "--output=streamed_jsonproto",
+    ]
+
+    # Popen + line iteration keeps memory constant instead of buffering
+    # a potentially multi-hundred-MB jsonproto stream all at once.
+    with subprocess.Popen(
+        argv,
+        cwd=str(workspace_dir),
+        stdout=subprocess.PIPE,
+        encoding="utf-8",
+    ) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parsed = _parse_entity(json.loads(line))
+            if parsed is not None:
+                yield parsed
+        process.wait()
+        # 0 = clean success; 3 = `--keep_going` swallowed at least one
+        # error but produced results for the rest. Any other exit means
+        # bazel failed hard (syntax error, unresolvable scope, OOM,
+        # ...) -- the streamed output is incomplete and we must not
+        # silently succeed.
+        if process.returncode not in (0, 3):
+            raise RuntimeError(
+                "bazel query exited with code "
+                f"{process.returncode}: {' '.join(argv)}"
+            )
+
+
+def _parse_entity(obj: dict[str, Any]) -> _Entity | None:
+    record_type = obj.get("type")
+    if record_type == "SOURCE_FILE":
+        name = obj.get("sourceFile", {}).get("name")
+        if not name:
+            return None
+        return _Entity(label=name, kind=_SOURCE_FILE_KIND)
+    if record_type != "RULE":
+        return None
+
+    rule = obj.get("rule", {})
+    label = rule.get("name")
+    if not label:
+        return None
+
+    tags: list[str] = []
+    attr_labels: dict[str, list[str]] = {}
+    for attr in rule.get("attribute", []):
+        name = attr.get("name")
+        if name == "tags":
+            tags = list(attr.get("stringListValue", []))
+        elif name in _SUBTREE_FILE_ATTRS:
+            values: list[str] = []
+            if "stringListValue" in attr:
+                values.extend(attr["stringListValue"])
+            elif attr.get("stringValue"):
+                values.append(attr["stringValue"])
+            if values:
+                attr_labels[name] = values
+
+    return _Entity(
+        label=label,
+        kind=rule.get("ruleClass", ""),
+        tags=tags,
+        attr_labels=attr_labels,
+    )
+
+
+def _quote_query_label(label: str) -> str:
+    escaped = label.replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + escaped + '"'
+
+
+def _label_to_path(label: str) -> str:
+    if not label.startswith("//"):
+        return label
+    if label.startswith("//:"):
+        return label[3:]
+    return label[2:].replace(":", "/")

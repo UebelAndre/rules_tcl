@@ -1,5 +1,6 @@
 load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
 load("@rules_venv//python:py_binary.bzl", "py_binary")
+load("@rules_venv//python:py_library.bzl", "py_library")
 load("//tcl/tclint:tclint_toolchain.bzl", "current_tclint_toolchain")
 
 current_tclint_toolchain(
@@ -16,6 +17,11 @@ py_binary(
     ],
 )
 
+py_library(
+    name = "target_query",
+    srcs = ["target_query.py"],
+)
+
 py_binary(
     name = "formatter",
     srcs = ["formatter.py"],
@@ -28,6 +34,7 @@ py_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":current_tclint_toolchain",
+        ":target_query",
         "@rules_venv//python/runfiles",
     ],
 )
